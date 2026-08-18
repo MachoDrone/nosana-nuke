@@ -1,0 +1,191 @@
+#!/bin/bash
+# Command Block 2 – Per-node nuke with menu + auto full-nuke on last host
+# Bind-mount discovery for Nosana data dirs
+# ONLY removes state files (nosana_db.json, podman/) – never the key or whole dir
+
+echo "=== Detecting nested Podman containers ==="
+mapfile -t DETECTED < <(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -i podman)
+
+if [ ${#DETECTED[@]} -eq 0 ]; then
+  echo "No nested Podman containers found."
+  exit 0
+fi
+
+echo
+echo "Container status:"
+echo "----------------------------------------"
+
+ELIGIBLE=()
+BLOCKED=()
+
+for i in "${!DETECTED[@]}"; do
+  name="${DETECTED[$i]}"
+  if docker exec "$name" podman ps --format '{{.Names}}' 2>/dev/null | grep -q "nosana-node"; then
+    echo -e "  [$i] \033[1;31m$name  ← BLOCKED (nosana-node running)\033[0m"
+    BLOCKED+=("$name")
+  else
+    echo -e "  [$i] \033[1;32m$name  ← ELIGIBLE (safe to nuke)\033[0m"
+    ELIGIBLE+=("$name")
+  fi
+done
+
+echo "----------------------------------------"
+echo
+
+if [ ${#ELIGIBLE[@]} -eq 0 ]; then
+  echo "No eligible containers to clean. All have nosana-node running."
+  exit 0
+fi
+
+echo "Enter the numbers of the containers you want to nuke"
+echo "(space-separated, e.g. 0 2), or type 'all' for all eligible ones:"
+read -p "> " CHOICE
+
+SELECTED=()
+
+if [[ "$CHOICE" == "all" ]]; then
+  SELECTED=("${ELIGIBLE[@]}")
+else
+  for idx in $CHOICE; do
+    if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -lt "${#DETECTED[@]}" ]; then
+      name="${DETECTED[$idx]}"
+      if docker exec "$name" podman ps --format '{{.Names}}' 2>/dev/null | grep -q "nosana-node"; then
+        echo -e "\033[1;31mSkipping $name (nosana-node is running)\033[0m"
+      else
+        SELECTED+=("$name")
+      fi
+    else
+      echo "Invalid selection: $idx"
+    fi
+  done
+fi
+
+if [ ${#SELECTED[@]} -eq 0 ]; then
+  echo "Nothing selected. Exiting."
+  exit 0
+fi
+
+echo
+echo "Will nuke the following containers:"
+printf '  - %s\n' "${SELECTED[@]}"
+echo
+echo "What will be removed:"
+echo "  • All containers, images, and volumes inside the selected Podman stack(s)"
+echo "  • The selected outer container(s) themselves"
+echo "  • Related Podman cache volumes (if present)"
+echo "  • nosana_db.json and the podman/ runtime dir in the bound Nosana data directory"
+echo "  • Default screen logs (screenlog.*) and excess journal logs"
+echo
+echo "What will be kept:"
+echo "  • nosana_key.json (node identity key)"
+echo "  • The Nosana data directory itself"
+echo
+echo "Full nuke (also runs when no Podman containers remain after this cleanup):"
+echo "  • Complete Docker data wipe (/var/lib/docker and /var/lib/containerd)"
+echo "  • Native Podman reset (rootful and rootless)"
+echo
+read -p "Proceed? [y/N]: " CONFIRM
+CONFIRM=${CONFIRM,,}
+
+if [[ "$CONFIRM" != "y" && "$CONFIRM" != "yes" ]]; then
+  echo "Aborted."
+  exit 0
+fi
+
+echo
+echo "=== Cleaning selected nested Podman stacks ==="
+for name in "${SELECTED[@]}"; do
+  echo "--- Nuking $name ---"
+
+  # Discover host paths bind-mounted to Nosana data location inside the container
+  mapfile -t DATA_DIRS < <(docker inspect -f '{{range .Mounts}}{{println .Source .Destination}}{{end}}' "$name" 2>/dev/null | \
+    awk '$2 == "/root/.nosana" || index($2, "/root/.nosana/") == 1 {print $1}')
+
+  if [ ${#DATA_DIRS[@]} -gt 0 ]; then
+    echo "  Discovered Nosana data dir(s) via bind mounts:"
+    printf '    - %s\n' "${DATA_DIRS[@]}"
+  else
+    echo "  No bind-mounted Nosana data dir detected for this container."
+  fi
+
+  # Clean inside nested Podman
+  docker exec "$name" podman stop -a 2>/dev/null || true
+  docker exec "$name" podman rm -af 2>/dev/null || true
+  docker exec "$name" podman rmi -af 2>/dev/null || true
+  docker exec "$name" podman volume prune -f 2>/dev/null || true
+  docker exec "$name" podman system prune -a -f --volumes 2>/dev/null || true
+  docker exec "$name" podman system reset -f 2>/dev/null || true
+
+  # Remove outer container
+  docker stop "$name" 2>/dev/null || true
+  docker rm -f "$name" 2>/dev/null || true
+
+  # Remove common volume name patterns
+  docker volume rm -f "$name" 2>/dev/null || true
+  docker volume rm -f "podman-cache-$name" 2>/dev/null || true
+  if [[ "$name" =~ gpu([0-9]+) ]]; then
+    docker volume rm -f "podman-cache-gpu${BASH_REMATCH[1]}" 2>/dev/null || true
+  fi
+
+  # Selective state cleanup – never delete the key or whole dir
+  for dir in "${DATA_DIRS[@]}"; do
+    if [ -n "$dir" ] && [ -d "$dir" ]; then
+      echo "  Clearing state in: $dir"
+      sudo rm -f "$dir/nosana_db.json" 2>/dev/null || true
+      sudo rm -rf "$dir/podman" 2>/dev/null || true
+      echo "  Kept directory and any key file in: $dir"
+    fi
+  done
+done
+
+# --------------------------------------------------
+# Check whether any nested Podman containers remain
+# --------------------------------------------------
+mapfile -t REMAINING < <(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -i podman)
+
+if [ ${#REMAINING[@]} -eq 0 ]; then
+  echo
+  echo "=== No nested Podman containers left – performing FULL nuclear wipe ==="
+
+  echo "=== Stopping Docker services ==="
+  sudo systemctl stop docker.socket docker.service containerd 2>/dev/null || true
+
+  echo "=== Nuclear Docker wipe ==="
+  sudo rm -rf /var/lib/docker /var/lib/containerd
+
+  echo "=== Restarting Docker ==="
+  sudo systemctl start docker 2>/dev/null || true
+
+  echo "=== Native Podman reset (rootful) ==="
+  sudo podman system reset -f 2>/dev/null || true
+
+  echo "=== Native Podman reset (rootless) ==="
+  podman system reset -f 2>/dev/null || true
+else
+  echo
+  echo "=== Some nested Podman containers still remain – skipping nuclear Docker wipe ==="
+  printf '  Still present: %s\n' "${REMAINING[@]}"
+
+  echo "=== Host-level cleanup (safe while other nodes run) ==="
+  if ! podman ps --format '{{.Names}}' 2>/dev/null | grep -q "nosana-node"; then
+    echo "Resetting native Podman..."
+    sudo podman system reset -f 2>/dev/null || true
+    podman system reset -f 2>/dev/null || true
+  else
+    echo "Skipping native Podman reset (nosana-node is running there)"
+  fi
+fi
+
+echo "=== Large log files in home ==="
+rm -f ~/screenlog.* 2>/dev/null || true
+
+echo "=== Nosana state cleanup (official default path, selective) ==="
+sudo rm -f ~/.nosana/nosana_db.json 2>/dev/null || true
+sudo rm -rf ~/.nosana/podman 2>/dev/null || true
+# Do NOT remove ~/.nosana itself or nosana_key.json
+
+echo "=== Vacuum journal ==="
+sudo journalctl --vacuum-size=200M
+
+echo "=== Done ==="
+df -h /
