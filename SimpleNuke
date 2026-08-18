@@ -1,0 +1,73 @@
+#!/bin/bash
+# Command Block MAIN – Community version
+# Goal: return Docker + Podman (native rootless, native rootful, and nested)
+#       to a near-fresh-install state
+# Bind-mount discovery for Nosana data dirs (selective: keeps key)
+
+# ============================================================
+# Safety check – do not run while nosana-node is active
+# ============================================================
+if docker exec podman podman ps --format '{{.Names}}' 2>/dev/null | grep -q "nosana-node" || \
+   podman ps --format '{{.Names}}' 2>/dev/null | grep -q "nosana-node"; then
+    echo -e "\n\033[1;31m ⚠ WARNING: nosana-node is still running. Stop it before running this cleanup. ⚠ \033[0m\n"
+    exit 1
+fi
+
+echo "=== Stopping Docker services ==="
+sudo systemctl stop docker.socket docker.service containerd 2>/dev/null || true
+
+echo "=== Nested Podman cleanup (graceful, while container still exists) ==="
+docker exec podman podman stop -a 2>/dev/null || true
+docker exec podman podman rm -af 2>/dev/null || true
+docker exec podman podman rmi -af 2>/dev/null || true
+docker exec podman podman volume prune -f 2>/dev/null || true
+docker exec podman podman system prune -a -f --volumes 2>/dev/null || true
+docker exec podman podman system reset -f 2>/dev/null || true
+
+# Discover host paths bind-mounted to Nosana data location (before removing container)
+mapfile -t DATA_DIRS < <(docker inspect -f '{{range .Mounts}}{{println .Source .Destination}}{{end}}' podman 2>/dev/null | \
+  awk '$2 == "/root/.nosana" || index($2, "/root/.nosana/") == 1 {print $1}')
+
+if [ ${#DATA_DIRS[@]} -gt 0 ]; then
+  echo "=== Discovered Nosana data dir(s) via bind mounts ==="
+  printf '  - %s\n' "${DATA_DIRS[@]}"
+fi
+
+echo "=== Stop and remove the outer podman container ==="
+docker stop podman 2>/dev/null || true
+docker rm -f podman 2>/dev/null || true
+
+echo "=== Nuclear Docker wipe ==="
+sudo rm -rf /var/lib/docker /var/lib/containerd
+
+echo "=== Restarting Docker ==="
+sudo systemctl start docker 2>/dev/null || true
+
+echo "=== Native Podman reset (rootful) ==="
+sudo podman system reset -f 2>/dev/null || true
+
+echo "=== Native Podman reset (rootless) ==="
+podman system reset -f 2>/dev/null || true
+
+echo "=== Nosana state cleanup (selective – keeps key) ==="
+# Clear state in any discovered bind-mounted data dirs
+for dir in "${DATA_DIRS[@]}"; do
+  if [ -n "$dir" ] && [ -d "$dir" ]; then
+    echo "  Clearing state in: $dir"
+    sudo rm -f "$dir/nosana_db.json" 2>/dev/null || true
+    sudo rm -rf "$dir/podman" 2>/dev/null || true
+    echo "  Kept directory and any key file in: $dir"
+  fi
+done
+# Official default path fallback
+sudo rm -f ~/.nosana/nosana_db.json 2>/dev/null || true
+sudo rm -rf ~/.nosana/podman 2>/dev/null || true
+
+echo "=== Large log files in home ==="
+rm -f ~/screenlog.* 2>/dev/null || true
+
+echo "=== Vacuum journal logs ==="
+sudo journalctl --vacuum-size=200M
+
+echo "=== Done ==="
+df -h /
